@@ -8,9 +8,14 @@
 # when an update needs a newer Go, and fails when the container's Go is too old.
 #
 # The commit is made through the GitHub API, so GitHub signs it; the merge robot
-# merges a Renovate PR only when every commit on it is signed by GitHub. A commit
-# made with GITHUB_TOKEN starts no workflow runs, so CodeQL and Semgrep are
-# dispatched on the new commit; workflow_dispatch is the exception to that rule.
+# merges a Renovate PR only when every commit on it is signed by GitHub. The
+# commit still starts the repository's pull_request workflows, but as
+# github-actions[bot], which is not a collaborator, so each run waits for
+# approval and runs nothing. The newest run of a workflow is the one the pull
+# request's checks show, so a waiting Semgrep run hides a passed one and the
+# merge robot finds the required Semgrep check missing. The job therefore waits
+# for those runs, deletes them, and then dispatches CodeQL and Semgrep on the
+# new commit.
 #
 # The commit is authored as github-actions[bot], so Renovate treats the branch
 # as edited and stops updating it. Renovate checks a branch it still manages
@@ -138,7 +143,7 @@ jobs:
           fi
           if ! git diff --quiet -- go.mod go.sum; then
             # expectedHeadOid fails the commit if Renovate moved the branch meanwhile
-            jq -n --arg repo "${GITHUB_REPOSITORY}" --arg branch "${BRANCH}" --arg head "$(git rev-parse HEAD)" \
+            fixup=$(jq -n --arg repo "${GITHUB_REPOSITORY}" --arg branch "${BRANCH}" --arg head "$(git rev-parse HEAD)" \
               --rawfile mod <(base64 -w0 go.mod) --rawfile sum <(base64 -w0 go.sum) '{
                 query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
                 variables: { input: {
@@ -150,12 +155,32 @@ jobs:
                   },
                   fileChanges: { additions: [ { path: "go.mod", contents: $mod }, { path: "go.sum", contents: $sum } ] }
                 } }
-              }' | gh api graphql --input -
+              }' | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid)
           elif [ "$(git log -1 --format=%ae)" != '41898282+github-actions[bot]@users.noreply.github.com' ]; then
             echo "go.mod and go.sum are already tidy"
             exit 0
+          else
+            fixup=$(git rev-parse HEAD)
           fi
           # The head is now a fixup commit: this run's, or that of an earlier run that
-          # failed or was canceled before dispatching, so a rerun dispatches as well
+          # failed or was canceled before dispatching, so a rerun dispatches as well.
+          # The fixup's pull_request runs wait for approval; delete them once GitHub
+          # has created them all, which is when two polls in a row find the same set.
+          # A rerun finds none, and dispatches after the deadline.
+          waiting() {
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${fixup}&event=pull_request&status=action_required" \
+              --jq '[.workflow_runs[].id | tostring] | sort | join(" ")'
+          }
+          seen=''
+          deadline=$((SECONDS + 90))
+          while [ "${SECONDS}" -lt "${deadline}" ]; do
+            sleep 10
+            now=$(waiting)
+            [ -n "${now}" ] && [ "${now}" = "${seen}" ] && break
+            seen=${now}
+          done
+          for id in ${seen}; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}"
+          done
           gh workflow run -R "${GITHUB_REPOSITORY}" codeql-analysis.yml --ref "${BRANCH}" -f build_branch="${BASE}"
           gh workflow run -R "${GITHUB_REPOSITORY}" semgrep.yml --ref "${BRANCH}"
